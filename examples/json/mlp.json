@@ -1,0 +1,29 @@
+{
+  "tensors": [
+    {
+      "name": "input",
+      "shape": [1, 4],
+      "dtype": "float32"
+    },
+    {
+      "name": "weight",
+      "shape": [4, 4],
+      "dtype": "float32",
+      "is_constant": true
+    },
+    {
+      "name": "output",
+      "shape": [1, 4],
+      "dtype": "float32"
+    }
+  ],
+  "ops": [
+    {
+      "kind": "MatMul",
+      "inputs": [0, 1],
+      "outputs": [2]
+    }
+  ],
+  "graph_inputs": [0],
+  "graph_outputs": [2]
+}
