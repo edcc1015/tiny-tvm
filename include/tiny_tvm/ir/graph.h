@@ -17,6 +17,8 @@ enum class DType {
     kInt32,
 };
 
+
+
 inline std::size_t dtype_size(DType dtype) noexcept {
     switch (dtype) {
         case DType::kFloat32:
@@ -37,6 +39,8 @@ struct Tensor {
     DType dtype = DType::kUnknown;
     std::size_t nbytes = 0;
     std::size_t offset = 0;
+    std::size_t param_offset = 0;  /* constant in params.bin */
+    std::vector<uint8_t> data;
     bool is_constant = false;
 };
 
@@ -55,11 +59,14 @@ public:
     int add_op(const Op& op);
     int add_op(Op&& op);
 
+    /* return tensor and op by index */
     Tensor& tensor(int index);
     const Tensor& tensor(int index) const;
+
     Op& op(int index);
     const Op& op(int index) const;
 
+    /* TODO */
     const std::vector<Tensor>& tensors() const noexcept;
     std::vector<Tensor>& mutable_tensors() noexcept;
     const std::vector<Op>& ops() const noexcept;
@@ -73,6 +80,7 @@ public:
     std::size_t tensor_count() const noexcept;
     std::size_t op_count() const noexcept;
     bool empty() const noexcept;
+
     std::string summary() const;
 
 private:
@@ -81,5 +89,15 @@ private:
     std::vector<int> graph_inputs_;
     std::vector<int> graph_outputs_;
 };
+
+inline int64_t num_elements(const Tensor& t) {
+    int64_t n = 1;
+    for (auto d : t.shape) n *= d;
+    return n;
+}
+
+inline size_t align_up(size_t value, size_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
 
 }  // namespace tiny_tvm::ir

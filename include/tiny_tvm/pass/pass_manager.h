@@ -18,6 +18,7 @@ public:
 
 private:
     std::vector<std::unique_ptr<Pass>> passes_;
+    bool verbose_ = false;
 };
 
 }  // namespace tiny_tvm::passes
