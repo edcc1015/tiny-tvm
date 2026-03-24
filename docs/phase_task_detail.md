@@ -1219,3 +1219,1084 @@ qemu-arm -L /usr/arm-linux-gnueabihf \
 #### 完成标准
 
 - 同一模型在 Host 和 ARM 上结果一致或近似一致（误差 < 1e-5）
+
+---
+
+# 阶段 6：类型系统与多 dtype 支持
+
+## 6.1 本阶段概述
+
+目前编译器只处理 `float32`，但现实中深度学习模型经常使用 `float16`（半精度训练/推理）、`int8`（量化推理）等数据类型。这个阶段的目标是把类型系统从 "只有 float32" 升级为多类型支持，并实现 int8 量化推理的最小闭环。
+
+**为什么这个阶段重要？**
+- 量化推理是嵌入式部署的核心技术，int8 推理速度可比 float32 快 2-4 倍
+- 类型错误是深度学习编译器中最常见的 bug 来源之一
+- 完善类型系统是后续所有高级优化的基础
+
+---
+
+## 任务 6-1：完善 DType 系统
+
+### 任务描述
+
+扩展 `DType` 枚举，在现有 `kUnknown / kFloat32 / kInt32` 基础上增加 `kFloat16 / kInt8 / kUInt8`，补全 `dtype_size()` 函数，增加 `dtype_to_string()` 和 `string_to_dtype()` 辅助函数，并让 `InferShapePass` 同时推导输出 dtype。
+
+### 实现逻辑
+
+#### 步骤 1：扩展 DType 枚举
+
+在 `include/tiny_tvm/ir/graph.h` 中修改：
+
+```cpp
+enum class DType {
+    kUnknown = 0,
+    kFloat32 = 1,
+    kInt32 = 2,
+    kFloat16 = 3,
+    kInt8 = 4,
+    kUInt8 = 5,
+};
+```
+
+#### 步骤 2：补全 dtype_size()
+
+```cpp
+inline size_t dtype_size(DType dt) {
+    switch (dt) {
+        case DType::kFloat32: return 4;
+        case DType::kInt32:   return 4;
+        case DType::kFloat16: return 2;
+        case DType::kInt8:    return 1;
+        case DType::kUInt8:   return 1;
+        default: return 0;
+    }
+}
+```
+
+#### 步骤 3：增加转换函数
+
+```cpp
+inline std::string dtype_to_string(DType dt) {
+    switch (dt) {
+        case DType::kFloat32: return "float32";
+        case DType::kInt32:   return "int32";
+        case DType::kFloat16: return "float16";
+        case DType::kInt8:    return "int8";
+        case DType::kUInt8:   return "uint8";
+        default: return "unknown";
+    }
+}
+
+inline DType string_to_dtype(const std::string& s) {
+    if (s == "float32") return DType::kFloat32;
+    if (s == "int32")   return DType::kInt32;
+    if (s == "float16") return DType::kFloat16;
+    if (s == "int8")    return DType::kInt8;
+    if (s == "uint8")   return DType::kUInt8;
+    return DType::kUnknown;
+}
+```
+
+#### 步骤 4：InferShapePass 推导 dtype
+
+在 `InferShapePass` 中增加类型推导规则：
+- `MatMul(int8, int8) → int32`（量化乘法结果需要更大的精度）
+- `MatMul(float32, float32) → float32`
+- `Add / Relu`：输出 dtype = 第一个输入 dtype
+
+### 为什么要做
+
+1. **扩展性**：只支持 float32 的编译器无法处理量化模型
+2. **正确性**：dtype 推导是后续所有 pass 和 codegen 的基础，推导错误会导致内存越界或精度错误
+3. **与 TVM 对齐**：TVM 的 `DataType` 是核心抽象之一，我们需要类似设计
+
+### 作用
+
+为编译器建立完整的类型基础设施，使其能表达和处理多种数据类型的 tensor。
+
+### 完成标准
+
+- `dtype_size()` 对 5 种已知类型返回正确字节数
+- `dtype_to_string()` 和 `string_to_dtype()` 互为逆函数
+- `InferShapePass` 对 int8 MatMul 推导出 int32 输出 dtype
+- JSON frontend 能解析 "float16"、"int8"、"uint8" 字符串
+
+---
+
+## 任务 6-2：实现 TypeCheckPass
+
+### 任务描述
+
+在编译管线中 `InferShapePass` 之后、codegen 之前增加一个 `TypeCheckPass`，用于检查所有 op 的输入/输出 dtype 是否合法。不合法时给出具体的错误信息（哪个 op、哪个 tensor、实际 dtype 是什么）。
+
+### 实现逻辑
+
+#### 步骤 1：定义 TypeCheckPass
+
+```cpp
+// include/tiny_tvm/pass/graph/type_check_pass.h
+class TypeCheckPass : public Pass {
+public:
+    std::string name() const override { return "TypeCheckPass"; }
+    void run(Graph& graph) override;
+};
+```
+
+#### 步骤 2：实现类型检查逻辑
+
+```cpp
+void TypeCheckPass::run(Graph& graph) {
+    for (auto& op : graph.ops()) {
+        switch (op.kind) {
+            case OpKind::kMatMul: {
+                auto& in0 = graph.tensor(op.inputs[0]);
+                auto& in1 = graph.tensor(op.inputs[1]);
+                if (in0.dtype != in1.dtype) {
+                    throw std::runtime_error(
+                        "TypeCheckPass: MatMul '" + op.name +
+                        "' input dtype mismatch: " +
+                        dtype_to_string(in0.dtype) + " vs " +
+                        dtype_to_string(in1.dtype));
+                }
+                break;
+            }
+            case OpKind::kAdd: { /* 类似检查 */ break; }
+            case OpKind::kRelu: {
+                auto& in = graph.tensor(op.inputs[0]);
+                auto& out = graph.tensor(op.outputs[0]);
+                if (in.dtype != out.dtype) {
+                    throw std::runtime_error(
+                        "TypeCheckPass: Relu '" + op.name +
+                        "' input/output dtype mismatch");
+                }
+                break;
+            }
+            // ... Conv2D 等
+        }
+    }
+}
+```
+
+#### 步骤 3：注册到编译管线
+
+在 `ttvmc compile` 的 pass 列表中，在 `InferShapePass` 之后添加 `TypeCheckPass`。
+
+### 为什么要做
+
+1. **尽早发现错误**：类型不匹配的错误如果传递到 codegen 会导致生成错误代码或运行时崩溃
+2. **编译器基本功**：所有成熟编译器都有类型检查 pass，这是编译器正确性的第一道防线
+3. **用户友好**：明确的报错信息比 segfault 更有助于调试
+
+### 作用
+
+作为编译管线中的一道"闸门"，确保只有类型合法的图才能进入 codegen 阶段。
+
+### 完成标准
+
+- 合法图（所有类型匹配）正常通过
+- dtype 不匹配时抛出异常，信息包含 op 名、tensor 名、具体 dtype
+- TypeCheckPass 在 PassManager 中可正常注册和运行
+
+---
+
+## 任务 6-3：int8 量化推理支持（入门版）
+
+### 任务描述
+
+让编译器能处理 int8 权重的模型，生成 int8 MatMul / Conv2D 的 C 代码，实现 int8 量化推理的最小闭环。
+
+### 实现逻辑
+
+#### 步骤 1：JSON Frontend 支持 int8
+
+在 `json_frontend.cpp` 中，解析 tensor 的 "dtype" 字段，支持 "int8"。对 int8 tensor，从 JSON 中读取整数数组存入 `tensor.data`。
+
+#### 步骤 2：Codegen 增加 int8 分支
+
+```cpp
+// 在 emit_matmul() 中
+if (in0_dtype == DType::kInt8) {
+    // int8 × int8 → int32 累加
+    out << "    int32_t sum = 0;\n";
+    out << "    for (int k = 0; k < K; k++) {\n";
+    out << "      sum += (int32_t)A[i*K+k] * (int32_t)B[k*N+j];\n";
+    out << "    }\n";
+    out << "    C[i*N+j] = sum;\n";
+} else {
+    // float32 版本
+    // ...
+}
+```
+
+#### 步骤 3：params.bin 支持 int8
+
+int8 tensor 按 1 字节/元素存储到 params.bin。加载时根据 dtype 确定每个元素大小。
+
+#### 步骤 4：准备测试模型
+
+创建 `examples/json/mlp_int8.json`，包含 int8 权重的 MLP。
+
+### 为什么要做
+
+1. **实用性**：int8 量化是嵌入式 AI 部署的主流技术
+2. **验证类型系统**：这是对 6-1 和 6-2 任务的端到端验证
+3. **性能认知**：int8 计算量更小，内存占用更低
+
+### 作用
+
+证明编译器的多 dtype 支持不只是枚举值的扩展，而是从前端解析到 codegen 到运行时的完整链路。
+
+### 完成标准
+
+- int8 MLP 模型编译运行成功
+- 输出 tensor 类型为 int32
+- params.bin 中 int8 tensor 按 1 字节存储
+- 数值结果正确（可通过手工计算验证小矩阵乘法）
+
+---
+
+# 阶段 7：图变换与算子扩展
+
+## 7.1 本阶段概述
+
+到目前为止编译器只支持 MatMul / Add / Relu / Conv2D 等少量算子。真实的 CNN 还需要 MaxPool、BatchNorm、Softmax 等。这个阶段的目标是：
+1. 扩展算子覆盖面
+2. 实现 BatchNorm 折叠优化
+3. 把 FusePass 升级为可扩展的模式匹配框架
+
+**为什么这个阶段重要？**
+- 算子覆盖面决定了编译器能处理多少真实模型
+- BatchNorm 折叠是 CNN 部署中最基本的优化之一
+- 可扩展的融合框架是编译器长期演进的基础
+
+---
+
+## 任务 7-1：补充常用算子
+
+### 任务描述
+
+新增 4 个常用算子：`MaxPool2D`、`GlobalAvgPool2D`、`Softmax`、`BatchNorm`（推理模式），包括 shape 推导和 C 代码生成。
+
+### 实现逻辑
+
+#### MaxPool2D
+
+**OpKind**：`kMaxPool2D`
+
+**attrs**：`kernel_shape`（如 [2,2]）、`strides`（如 [2,2]）、`pads`（如 [0,0,0,0]）
+
+**Shape 推导**：
+```
+输入: [N, C, H, W]
+OH = (H + pad_top + pad_bottom - KH) / stride_h + 1
+OW = (W + pad_left + pad_right - KW) / stride_w + 1
+输出: [N, C, OH, OW]
+```
+
+**Codegen**：
+```cpp
+for (n) for (c) for (oh) for (ow) {
+    float max_val = -FLT_MAX;
+    for (kh) for (kw) {
+        int ih = oh * stride_h - pad_top + kh;
+        int iw = ow * stride_w - pad_left + kw;
+        if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+            max_val = fmax(max_val, input[n][c][ih][iw]);
+    }
+    output[n][c][oh][ow] = max_val;
+}
+```
+
+#### GlobalAvgPool2D
+
+**OpKind**：`kGlobalAvgPool2D`
+
+**Shape 推导**：`[N,C,H,W] → [N,C,1,1]`
+
+**Codegen**：
+```cpp
+for (n) for (c) {
+    float sum = 0;
+    for (h) for (w) sum += input[n][c][h][w];
+    output[n][c][0][0] = sum / (H * W);
+}
+```
+
+#### Softmax
+
+**OpKind**：`kSoftmax`
+
+**attrs**：`axis`（默认 -1，即最后一个维度）
+
+**Shape 推导**：输出 shape = 输入 shape
+
+**Codegen**（数值稳定版）：
+```cpp
+// 1. 找 max
+float max_val = -FLT_MAX;
+for (j) max_val = fmax(max_val, x[j]);
+// 2. exp(x - max)
+float sum = 0;
+for (j) { exp_vals[j] = expf(x[j] - max_val); sum += exp_vals[j]; }
+// 3. 归一化
+for (j) y[j] = exp_vals[j] / sum;
+```
+
+#### BatchNorm（推理模式）
+
+**OpKind**：`kBatchNorm`
+
+**输入**：`x`（数据）、`scale`（gamma）、`bias`（beta）、`mean`、`var`
+
+**attrs**：`epsilon`（默认 1e-5）
+
+**Shape 推导**：输出 shape = 输入 shape
+
+**Codegen**：
+```cpp
+for (n) for (c) for (h) for (w) {
+    float norm = (x[n][c][h][w] - mean[c]) / sqrtf(var[c] + eps);
+    output[n][c][h][w] = scale[c] * norm + bias[c];
+}
+```
+
+### 为什么要做
+
+1. **模型覆盖**：没有 MaxPool 和 BatchNorm，大部分 CNN（ResNet、VGG）都无法编译
+2. **完整性**：Softmax 是分类任务必需的；GlobalAvgPool 是现代网络的标配
+3. **算子扩展模式**：这 4 个算子展示了"增加新算子"的标准流程
+
+### 作用
+
+让编译器从"能跑简单 MLP/CNN"升级为"能处理真实 CNN 的主要算子"。
+
+### 完成标准
+
+- 4 个新算子的 shape infer 和 codegen 都正确
+- 含新算子的模型能通过 `ttvmc compile` 编译并运行
+- 算子数值正确（可通过小输入手工验证）
+
+---
+
+## 任务 7-2：实现 BatchNormFoldPass
+
+### 任务描述
+
+当 `BatchNorm` 紧跟 `Conv2D` 时，把 BN 的参数（gamma, beta, mean, var）折叠进 Conv 的 weight 和 bias 中，从而消除 BN op，减少推理时计算量。
+
+### 实现逻辑
+
+#### 数学推导
+
+Conv2D 输出 `y[oc] = sum(w[oc] * x) + conv_bias[oc]`
+
+BN 输出 `z[oc] = gamma[oc] * (y[oc] - mean[oc]) / sqrt(var[oc] + eps) + beta[oc]`
+
+折叠后：
+```
+scale[oc] = gamma[oc] / sqrt(var[oc] + eps)
+new_weight[oc, ic, kh, kw] = scale[oc] * old_weight[oc, ic, kh, kw]
+new_bias[oc] = scale[oc] * (old_conv_bias[oc] - mean[oc]) + beta[oc]
+```
+
+#### 代码实现
+
+```cpp
+void BNFoldPass::run(Graph& graph) {
+    for (int i = 0; i < graph.num_ops() - 1; i++) {
+        auto& conv_op = graph.op(i);
+        auto& bn_op = graph.op(i + 1);
+        if (conv_op.kind != OpKind::kConv2D ||
+            bn_op.kind != OpKind::kBatchNorm)
+            continue;
+        // 检查 conv 输出是 bn 的输入
+        if (conv_op.outputs[0] != bn_op.inputs[0]) continue;
+
+        // 获取 BN 参数
+        auto& gamma = graph.tensor(bn_op.inputs[1]);
+        auto& beta  = graph.tensor(bn_op.inputs[2]);
+        auto& mean  = graph.tensor(bn_op.inputs[3]);
+        auto& var   = graph.tensor(bn_op.inputs[4]);
+        float eps = bn_op.attrs.count("epsilon") ?
+                    std::stof(bn_op.attrs["epsilon"]) : 1e-5f;
+
+        // 计算 scale
+        int oc = gamma.shape[0];
+        std::vector<float> scale(oc);
+        for (int c = 0; c < oc; c++)
+            scale[c] = gamma.data_as<float>()[c] /
+                       std::sqrt(var.data_as<float>()[c] + eps);
+
+        // 折叠 weight
+        auto& weight = graph.tensor(conv_op.inputs[1]);
+        // weight shape: [OC, IC, KH, KW]
+        int per_oc = weight.num_elements() / oc;
+        for (int c = 0; c < oc; c++)
+            for (int j = 0; j < per_oc; j++)
+                weight.data_as<float>()[c * per_oc + j] *= scale[c];
+
+        // 折叠 bias
+        auto& conv_bias = graph.tensor(conv_op.inputs[2]);
+        for (int c = 0; c < oc; c++) {
+            float new_b = scale[c] * (conv_bias.data_as<float>()[c] -
+                          mean.data_as<float>()[c]) +
+                          beta.data_as<float>()[c];
+            conv_bias.data_as<float>()[c] = new_b;
+        }
+
+        // 删除 BN op，更新 conv 输出为 bn 输出
+        conv_op.outputs[0] = bn_op.outputs[0];
+        graph.remove_op(i + 1);
+    }
+}
+```
+
+### 为什么要做
+
+1. **性能**：BN 折叠后推理时不再需要额外的 BN 计算，节省 ~10-20% 时间
+2. **行业标准**：几乎所有推理框架（TFLite、ONNX Runtime、TensorRT）都做 BN 折叠
+3. **验证 Pass 框架**：这是一个"改变图结构"的 pass，验证图编辑能力
+
+### 作用
+
+作为图级别优化的典型案例，展示编译器如何通过数学等价变换来优化模型。
+
+### 完成标准
+
+- Conv + BN 被折叠为单个 Conv
+- BN op 从图中消失
+- 折叠前后推理结果数值一致（误差 < 1e-5）
+
+---
+
+## 任务 7-3：扩展 FusePass 为模式匹配框架
+
+### 任务描述
+
+把现有的硬编码 FusePass（只处理 Conv+Relu）升级为基于模式描述的可扩展融合框架。新增融合规则只需注册一个 `FusePattern` 结构体。
+
+### 实现逻辑
+
+#### 步骤 1：定义 FusePattern
+
+```cpp
+struct FusePattern {
+    std::string name;  // 融合后的名字，如 "ConvRelu"
+    OpKind head;       // 第一个 op
+    OpKind tail;       // 第二个 op
+    OpKind fused_kind; // 融合后的 op kind
+};
+```
+
+#### 步骤 2：FusePass 维护模式列表
+
+```cpp
+class FusePass : public Pass {
+    std::vector<FusePattern> patterns_;
+public:
+    FusePass() {
+        patterns_.push_back({"ConvRelu", OpKind::kConv2D,
+                             OpKind::kRelu, OpKind::kConvRelu});
+        patterns_.push_back({"MatMulAdd", OpKind::kMatMul,
+                             OpKind::kAdd, OpKind::kMatMulAdd});
+    }
+    void add_pattern(FusePattern p) { patterns_.push_back(p); }
+};
+```
+
+#### 步骤 3：通用匹配引擎
+
+```cpp
+void FusePass::run(Graph& graph) {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& pat : patterns_) {
+            for (int i = 0; i < graph.num_ops() - 1; i++) {
+                auto& op1 = graph.op(i);
+                auto& op2 = graph.op(i + 1);
+                if (op1.kind != pat.head || op2.kind != pat.tail)
+                    continue;
+                // 检查 op1 输出是 op2 唯一输入
+                if (op1.outputs[0] != op2.inputs[0]) continue;
+                // 融合
+                op1.kind = pat.fused_kind;
+                op1.name = pat.name + "_" + op1.name;
+                op1.outputs = op2.outputs;
+                graph.remove_op(i + 1);
+                changed = true;
+                break;
+            }
+        }
+    }
+}
+```
+
+### 为什么要做
+
+1. **可维护性**：硬编码的融合规则难以维护和扩展
+2. **可扩展性**：新增融合规则只需一行 `add_pattern(...)`
+3. **与 TVM 对齐**：TVM Relay 的 FuseOps 也是基于模式匹配的框架
+
+### 作用
+
+把编译器的融合能力从"只能融合 Conv+Relu"升级为"可融合任意注册的算子对"。
+
+### 完成标准
+
+- `Conv + Relu → ConvRelu` 和 `MatMul + Add → MatMulAdd` 都被正确融合
+- 新增融合规则只需一行注册代码
+- 融合前后数值结果一致
+
+---
+
+# 阶段 8：真正的 TensorIR 雏形（⭐ 最重要）
+
+## 8.1 本阶段概述
+
+这是整个项目中**最核心**的阶段。此前的 codegen 直接从 Op 生成 C 代码，Schedule 只是一些标志位。这个阶段引入 **LoopIR**，把计算描述（Op → 做什么运算）和调度描述（LoopIR → 怎么执行循环）完全分离。
+
+**这正是 TVM TensorIR 的核心设计思想：**
+- Op 只描述"语义"（MatMul 是矩阵乘法）
+- LoopIR 描述"实现"（用哪些循环、什么顺序、如何分块）
+- Schedule 原语（split、reorder、fuse）操作 LoopIR，而不是直接改 codegen
+
+**为什么这个阶段最重要？**
+- 这是"教学级 TVM"和"真正理解 TVM"的分水岭
+- 计算-调度分离是 TVM 区别于其他框架的核心创新
+- 完成这个阶段后，你才能说"我理解 TVM 的架构"
+
+---
+
+## 任务 8-1：抽象循环 IR（LoopIR）
+
+### 任务描述
+
+定义 LoopIR 的核心数据结构：`LoopVar`（循环变量）、`Block`（一个计算块，对应一个 Op）、`LoopProgram`（整个程序的循环表示）。
+
+### 实现逻辑
+
+#### LoopVar
+
+```cpp
+struct LoopVar {
+    std::string name;    // 如 "i", "j", "k"
+    int64_t extent = 0;  // 循环范围 [0, extent)
+};
+```
+
+一个 LoopVar 对应 for 循环中的一个循环变量。
+
+#### Block
+
+```cpp
+struct Block {
+    std::string name;                     // 如 "matmul_0"
+    std::vector<LoopVar> loop_vars;       // 所有循环变量
+    std::vector<int> loop_order;          // 执行顺序（索引到 loop_vars）
+    std::string compute_body;             // C 代码片段
+    std::vector<int> read_tensors;        // 读取的 tensor index
+    std::vector<int> write_tensors;       // 写入的 tensor index
+
+    struct TileInfo {
+        int var_index = -1;     // 被 split 的变量索引
+        int factor = -1;        // split 因子
+        int outer_index = -1;   // split 后外层变量索引
+        int inner_index = -1;   // split 后内层变量索引
+    };
+    std::vector<TileInfo> tiles;          // split 记录
+    bool unroll_innermost = false;        // 是否展开最内层
+};
+```
+
+Block 是 LoopIR 的核心抽象。每个 Block 对应一个 Op 的循环嵌套。`loop_order` 定义了循环从外到内的顺序，split 操作会添加新的 LoopVar 并更新 loop_order。
+
+#### LoopProgram
+
+```cpp
+struct LoopProgram {
+    std::vector<Block> blocks;
+    const Graph* source_graph = nullptr;
+};
+```
+
+#### 设计要点
+
+- **MatMul [M,K] × [K,N]**：3 个 loop_vars（i:M, j:N, k:K），默认 loop_order = [0,1,2]
+- **Conv2D**：7 个 loop_vars（n, oc, oh, ow, ic, kh, kw）
+- **逐元素 op（Add/Relu）**：按 tensor rank 生成 loop_vars
+
+### 为什么要做
+
+1. **核心抽象**：LoopIR 是计算-调度分离的基础数据结构
+2. **可操作性**：有了 LoopIR，schedule 原语才有操作对象
+3. **与 TVM 对齐**：TVM 的 `tir.PrimFunc` 本质上就是 LoopIR
+
+### 作用
+
+建立 LoopIR 数据结构，为后续的 lowering、schedule 原语、codegen 提供统一的中间表示。
+
+### 完成标准
+
+- LoopVar / Block / LoopProgram 结构体定义完成
+- 能手工构造 MatMul 的 Block（3 个 loop_vars，正确的 compute_body）
+- 能手工构造 Conv2D 的 Block（7 个 loop_vars）
+- Block 的 loop_order 可以被修改
+
+---
+
+## 任务 8-2：实现 LowerToLoopIRPass 和 Schedule 原语
+
+### 任务描述
+
+实现从 Graph 到 LoopProgram 的 lowering pass，以及 split / reorder / fuse 三个 schedule 原语。
+
+### 实现逻辑
+
+#### LowerToLoopIRPass
+
+```cpp
+class LowerToLoopIRPass {
+public:
+    LoopProgram lower(const Graph& graph);
+private:
+    Block lower_matmul(const Op& op, const Graph& graph);
+    Block lower_conv2d(const Op& op, const Graph& graph);
+    Block lower_elementwise(const Op& op, const Graph& graph);
+};
+```
+
+**MatMul lowering**：
+```cpp
+Block lower_matmul(const Op& op, const Graph& graph) {
+    auto& A = graph.tensor(op.inputs[0]);  // [M, K]
+    auto& B = graph.tensor(op.inputs[1]);  // [K, N]
+    Block block;
+    block.name = op.name;
+    block.loop_vars = {{"i", A.shape[0]}, {"j", B.shape[1]}, {"k", A.shape[1]}};
+    block.loop_order = {0, 1, 2};  // i, j, k
+    block.compute_body = "C[i * N + j] += A[i * K + k] * B[k * N + j];";
+    block.read_tensors = {op.inputs[0], op.inputs[1]};
+    block.write_tensors = {op.outputs[0]};
+    return block;
+}
+```
+
+#### split 原语
+
+```cpp
+void split(Block& block, int var_index, int factor) {
+    auto& var = block.loop_vars[var_index];
+    int outer_extent = (var.extent + factor - 1) / factor;
+
+    // 创建 outer 和 inner 变量
+    LoopVar outer{var.name + "_outer", outer_extent};
+    LoopVar inner{var.name + "_inner", factor};
+
+    int outer_idx = block.loop_vars.size();
+    int inner_idx = outer_idx + 1;
+    block.loop_vars.push_back(outer);
+    block.loop_vars.push_back(inner);
+
+    // 更新 loop_order：把 var_index 替换为 outer, inner
+    auto it = std::find(block.loop_order.begin(),
+                        block.loop_order.end(), var_index);
+    *it = outer_idx;
+    block.loop_order.insert(it + 1, inner_idx);
+
+    // 记录 tile 信息
+    block.tiles.push_back({var_index, factor, outer_idx, inner_idx});
+}
+```
+
+#### reorder 原语
+
+```cpp
+void reorder(Block& block, const std::vector<int>& new_order) {
+    block.loop_order = new_order;
+}
+```
+
+#### fuse_loops 原语
+
+```cpp
+void fuse_loops(Block& block, int var1_index, int var2_index) {
+    auto& v1 = block.loop_vars[var1_index];
+    auto& v2 = block.loop_vars[var2_index];
+    int64_t new_extent = v1.extent * v2.extent;
+
+    LoopVar fused{v1.name + "_" + v2.name, new_extent};
+    int fused_idx = block.loop_vars.size();
+    block.loop_vars.push_back(fused);
+
+    // 更新 loop_order：把 var1, var2 替换为 fused
+    auto it1 = std::find(block.loop_order.begin(),
+                         block.loop_order.end(), var1_index);
+    *it1 = fused_idx;
+    block.loop_order.erase(
+        std::find(block.loop_order.begin(),
+                  block.loop_order.end(), var2_index));
+}
+```
+
+### 为什么要做
+
+1. **Lowering 是编译器标准流程**：从高级 IR（Graph）到低级 IR（LoopIR）的转换
+2. **Schedule 原语是 TVM 的核心特性**：用户通过 schedule 原语控制代码生成
+3. **分离关注点**：Op 只管语义，LoopIR 管实现细节
+
+### 作用
+
+- LowerToLoopIRPass 把 Graph 中的每个 Op 转化为 LoopIR Block
+- Schedule 原语让用户可以优化 LoopIR 的循环结构
+- 这两者结合实现了"同一个 MatMul，不同的执行方式"
+
+### 完成标准
+
+- MatMul / Conv2D / Add / Relu 都能正确 lower 为 Block
+- split(i, 16) 后 loop_vars 增加 i_outer 和 i_inner
+- reorder 后 loop_order 改变
+- fuse 后两个变量合并为一个
+
+---
+
+## 任务 8-3：Codegen 从 LoopIR 生成 C 代码
+
+### 任务描述
+
+新建 `loop_ir_codegen.cpp`，从 LoopProgram 递归生成嵌套 for 循环的 C 代码。修改 `ttvmc compile` 管线，在 lowering 后使用 LoopIR codegen。
+
+### 实现逻辑
+
+#### 核心函数
+
+```cpp
+std::string emit_c_from_loop_program(const LoopProgram& prog) {
+    std::ostringstream out;
+    // 文件头
+    out << "#include <stdint.h>\n#include <math.h>\n\n";
+
+    // 为每个 block 生成一个函数
+    for (auto& block : prog.blocks) {
+        emit_block(out, block, *prog.source_graph);
+    }
+
+    // 生成 tiny_tvm_run 入口
+    emit_run_function(out, prog);
+
+    return out.str();
+}
+```
+
+#### Block 代码生成
+
+```cpp
+void emit_block(std::ostream& out, const Block& block,
+                const Graph& graph) {
+    int indent = 1;
+    // 按 loop_order 发射嵌套 for
+    for (int idx : block.loop_order) {
+        auto& var = block.loop_vars[idx];
+        // 检查是否是 tile 的内层
+        bool is_tile_inner = false;
+        int tile_factor = 0;
+        for (auto& t : block.tiles) {
+            if (t.inner_index == idx) {
+                is_tile_inner = true;
+                tile_factor = t.factor;
+                break;
+            }
+        }
+
+        std::string spaces(indent * 2, ' ');
+        if (block.unroll_innermost &&
+            idx == block.loop_order.back()) {
+            // 展开最内层
+            for (int u = 0; u < var.extent; u++) {
+                out << spaces << "// " << var.name << " = " << u << "\n";
+                out << spaces << "{ int " << var.name << " = " << u << ";\n";
+                out << spaces << "  " << block.compute_body << "\n";
+                out << spaces << "}\n";
+            }
+        } else {
+            out << spaces << "for (int " << var.name
+                << " = 0; " << var.name << " < " << var.extent
+                << "; " << var.name << "++) {\n";
+            indent++;
+        }
+    }
+
+    // 最内层循环体
+    if (!block.unroll_innermost) {
+        std::string spaces(indent * 2, ' ');
+        out << spaces << block.compute_body << "\n";
+    }
+
+    // 关闭循环
+    for (int i = block.loop_order.size() - 1; i >= 0; i--) {
+        if (block.unroll_innermost &&
+            block.loop_order[i] == block.loop_order.back())
+            continue;
+        indent--;
+        std::string spaces(indent * 2, ' ');
+        out << spaces << "}\n";
+    }
+}
+```
+
+#### 管线集成
+
+在 `ttvmc compile` 中：
+1. Parse → InferShape → ... → 现有 passes
+2. **新增**：LowerToLoopIRPass → 可选 schedule 操作 → LoopIR Codegen
+3. 保留旧 codegen 作为 `--legacy-codegen` fallback
+
+### 为什么要做
+
+1. **闭环验证**：LoopIR 只有能生成正确代码才有意义
+2. **与旧 codegen 对比**：证明新的 LoopIR 方案功能等价
+3. **schedule 效果可见**：split + reorder 后生成的代码结构确实不同
+
+### 作用
+
+把 LoopIR 从"数据结构"变成"可执行的编译流程"，完成计算-调度分离的完整链路。
+
+### 完成标准
+
+- LoopIR codegen 生成的代码能编译运行，结果与旧 codegen 一致
+- split 后代码有双层循环（外层步进 factor，内层范围 factor）
+- reorder 后循环嵌套顺序改变
+- 管线可切换新旧 codegen
+
+---
+
+# 阶段 9：性能分析与 Auto-Tuning 雏形
+
+## 9.1 本阶段概述
+
+有了 LoopIR 和 schedule 原语后，自然的下一步是：怎么知道哪种 schedule 更快？这个阶段实现：
+1. 按 op 粒度的性能 profiling
+2. 基于 GridSearch 的简单 auto-tuner
+3. `ttvmc tune` 命令
+
+**为什么这个阶段重要？**
+- 手动调参是不可扩展的，需要自动化搜索
+- 这正是 TVM AutoTVM / AutoScheduler 的思想原型
+- Profiling 是任何性能优化工作的基础
+
+---
+
+## 任务 9-1：编译时性能 Profile 基础设施
+
+### 任务描述
+
+在生成的 `deploy.c` 中为每个 op 插入计时桩（条件编译），让 `run_model --profile` 能输出每个 op 的执行时间。
+
+### 实现逻辑
+
+#### 步骤 1：Codegen 插入计时代码
+
+在 `emit_c_module()`（或 LoopIR codegen）中：
+
+```cpp
+// 条件编译的计时支持
+out << "#ifdef TINY_TVM_PROFILE\n";
+out << "#include <time.h>\n";
+out << "static double op_times[" << num_ops << "];\n";
+out << "#endif\n\n";
+
+// 每个 op 前后
+out << "#ifdef TINY_TVM_PROFILE\n";
+out << "  struct timespec _ts_start, _ts_end;\n";
+out << "  clock_gettime(CLOCK_MONOTONIC, &_ts_start);\n";
+out << "#endif\n";
+// ... op 代码 ...
+out << "#ifdef TINY_TVM_PROFILE\n";
+out << "  clock_gettime(CLOCK_MONOTONIC, &_ts_end);\n";
+out << "  op_times[" << op_idx << "] = "
+    << "(_ts_end.tv_sec - _ts_start.tv_sec) * 1e6 + "
+    << "(_ts_end.tv_nsec - _ts_start.tv_nsec) / 1e3;\n";
+out << "#endif\n";
+```
+
+#### 步骤 2：导出 profile 数据
+
+```cpp
+out << "#ifdef TINY_TVM_PROFILE\n";
+out << "void tiny_tvm_get_profile(double* out, int max_ops) {\n";
+out << "    for (int i = 0; i < " << num_ops << " && i < max_ops; i++)\n";
+out << "        out[i] = op_times[i];\n";
+out << "}\n";
+out << "#endif\n";
+```
+
+#### 步骤 3：run_model --profile
+
+1. 编译时加 `-DTINY_TVM_PROFILE`
+2. 运行模型多次（如 10 次），取中位数
+3. 输出 `profile_report.json`：
+   ```json
+   {
+     "ops": [
+       {"name": "matmul_0", "time_us": 123.4},
+       {"name": "add_0", "time_us": 5.6}
+     ],
+     "total_us": 129.0
+   }
+   ```
+
+### 为什么要做
+
+1. **量化优化效果**：没有计时数据，无法判断 schedule 变化是否真的更快
+2. **Auto-Tuning 基础**：tuner 需要 profile 结果来评估候选方案
+3. **性能分析能力**：找出瓶颈 op 是优化的第一步
+
+### 作用
+
+为编译器增加"测量"能力，把性能优化从猜测变成数据驱动。
+
+### 完成标准
+
+- `run_model --profile` 输出每个 op 的执行时间
+- `profile_report.json` 格式正确、可解析
+- 时间数值合理（不为 0，不为负数）
+
+---
+
+## 任务 9-2：实现简单 Auto-Tuner（GridSearch 版）
+
+### 任务描述
+
+对 MatMul 的 tile 参数进行网格搜索（GridSearch），自动找出最快的 (tile_m, tile_n, tile_k) 组合。
+
+### 实现逻辑
+
+#### 步骤 1：定义搜索空间
+
+```cpp
+class GridSearchTuner {
+    std::vector<int> candidates_ = {8, 16, 32, 64};
+public:
+    struct TuneResult {
+        int tile_m, tile_n, tile_k;
+        double time_us;
+    };
+
+    TuneResult tune(const Graph& graph, int op_index);
+};
+```
+
+#### 步骤 2：搜索循环
+
+```cpp
+TuneResult GridSearchTuner::tune(const Graph& graph, int op_index) {
+    TuneResult best = {8, 8, 8, 1e18};
+
+    for (int tm : candidates_) {
+        for (int tn : candidates_) {
+            for (int tk : candidates_) {
+                // 1. 设置 schedule
+                Schedule sched;
+                sched.tile_m = tm; sched.tile_n = tn; sched.tile_k = tk;
+
+                // 2. Lower to LoopIR + apply schedule
+                auto prog = lower_with_schedule(graph, op_index, sched);
+
+                // 3. Codegen
+                auto code = emit_c_from_loop_program(prog);
+
+                // 4. Compile + Profile
+                double time_us = compile_and_profile(code);
+
+                // 5. 记录
+                if (time_us < best.time_us) {
+                    best = {tm, tn, tk, time_us};
+                }
+
+                printf("  tile=(%d,%d,%d) → %.1f us\n", tm, tn, tk, time_us);
+            }
+        }
+    }
+    return best;
+}
+```
+
+#### 步骤 3：输出 best_schedule.json
+
+```json
+{
+  "ops": [
+    {
+      "name": "matmul_0",
+      "tile_m": 32,
+      "tile_n": 32,
+      "tile_k": 16,
+      "time_us": 45.2
+    }
+  ]
+}
+```
+
+### 为什么要做
+
+1. **自动化优化**：手动尝试 tile 组合不可扩展，需要自动搜索
+2. **TVM 核心思想**：AutoTVM 就是通过搜索找最优 schedule
+3. **闭环验证**：验证了 LoopIR + schedule 原语 + codegen + profile 的完整链路
+
+### 作用
+
+把"人肉调参"变成"自动搜索"，这是 TVM AutoTVM 的最小化原型。
+
+### 完成标准
+
+- GridSearch 遍历所有 (tile_m, tile_n, tile_k) 组合
+- 最终选出的配置不慢于默认配置
+- 输出 `best_schedule.json`
+
+---
+
+## 任务 9-3：ttvmc tune 子命令
+
+### 任务描述
+
+为 `ttvmc` CLI 增加 `tune` 子命令，用户通过一条命令就能完成模型的自动调参。
+
+### 实现逻辑
+
+#### 命令格式
+
+```
+./build/ttvmc tune model.json -o out/ --schedule-out best_schedule.json
+```
+
+#### 实现步骤
+
+1. 在 `ttvmc.cpp` 中新增 `tune` 子命令分支。
+2. 解析模型 → InferShape → 对每个 MatMul op 调用 `GridSearchTuner::tune()`。
+3. 汇总结果，写入 `best_schedule.json`。
+4. 打印调参进度和最终结果。
+
+#### compile 读取 schedule
+
+`ttvmc compile` 增加 `--schedule` 参数：
+```
+./build/ttvmc compile model.json -o out/ --schedule best_schedule.json
+```
+
+从 JSON 读取每个 op 的 tile 参数，应用到 LoopIR，然后 codegen。
+
+### 为什么要做
+
+1. **完整的工具链**：tune → compile → run 三步走
+2. **用户体验**：一条命令完成调参，不需要手动编辑 schedule
+3. **与 TVM 对齐**：`tvmc tune` + `tvmc compile` 就是这个工作流
+
+### 作用
+
+把 auto-tuning 能力暴露给用户，完成 tiny-tvm 工具链的最后一块拼图。
+
+### 完成标准
+
+- `ttvmc tune model.json -o out/ --schedule-out best.json` 运行成功
+- `ttvmc compile model.json -o out/ --schedule best.json` 能读取和应用调参结果
+- 调参后的模型性能不低于默认配置

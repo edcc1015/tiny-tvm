@@ -1021,9 +1021,418 @@ qemu-arm -L /usr/arm-linux-gnueabihf build-arm/run_model out/mlp input.bin outpu
 
 ---
 
-## 8. 每个阶段必须补的测试
+## 8. 阶段 6：类型系统与多 dtype 支持
 
-这个部分不是“有空再做”，而是每一阶段都必须跟着补。
+### 8.1 本阶段目标
+
+把"只支持 float32"的现状扩展为多类型编译器。完成后你应该拥有：
+
+- 完整的 DType 枚举（float32 / float16 / int8 / int32 / uint8）
+- dtype 合法性校验
+- int8 量化推理的最小闭环
+
+### 8.2 本阶段要新增或重点修改的文件
+
+- `include/tiny_tvm/ir/graph.h`
+- `src/ir/graph.cpp`
+- `include/tiny_tvm/pass/graph/type_check_pass.h`
+- `src/pass/graph/type_check_pass.cpp`
+- `src/pass/graph/infer_shape_pass.cpp`
+- `src/frontend/json/json_frontend.cpp`
+- `src/codegen/c_codegen.cpp`
+- `tests/pass/type_check_test.cpp`
+- `tests/runtime/int8_matmul_e2e_test.cpp`
+- `examples/json/mlp_int8.json`
+
+### 8.3 任务 6-1：完善 DType 系统
+
+#### 要做什么
+
+扩展 `DType` 枚举，补全 `dtype_size()`，让 `InferShapePass` 同时推导 dtype。
+
+#### 具体实现方法
+
+1. 在 `DType` 枚举中增加 `kFloat16`、`kInt8`、`kUInt8`。
+2. `dtype_size()` 对 `kFloat16` 返回 2，`kInt8` / `kUInt8` 返回 1。
+3. 增加 `dtype_to_string(DType)` 和 `string_to_dtype(const std::string&)` 辅助函数。
+4. `InferShapePass` 推导 dtype：
+   - `MatMul(int8, int8) → int32`
+   - `MatMul(float32, float32) → float32`
+   - `Add` / `Relu`：输出 dtype = 输入 dtype
+5. JSON frontend 解析新 dtype 字符串。
+
+#### 完成标准
+
+- `dtype_size()` 对 5 种类型返回正确值
+- `InferShapePass` 对 int8 MatMul 推出 int32 输出
+- JSON frontend 能解析新 dtype 字符串
+
+### 8.4 任务 6-2：实现 `TypeCheckPass`
+
+#### 要做什么
+
+在 codegen 之前增加类型合法性校验 pass。
+
+#### 具体实现方法
+
+1. 新建 `TypeCheckPass`，放在 `pass/graph/`。
+2. 遍历所有 op，按 kind 分发检查：
+   - `MatMul`：两个输入 dtype 必须一致
+   - `Add`：两个输入 dtype 必须一致
+   - `Relu`：输入和输出 dtype 必须一致
+   - `Conv2D`：输入和 weight dtype 必须一致
+3. 不合法时报错包含：op 名、tensor 名、具体 dtype。
+4. 安排在 `InferShapePass` 之后、codegen 之前。
+
+#### 完成标准
+
+- dtype 不匹配时报错明确
+- 合法图正常通过
+
+### 8.5 任务 6-3：int8 量化推理支持（入门版）
+
+#### 要做什么
+
+让编译器能处理 int8 权重模型，生成 int8 MatMul / Conv2D 的 C 代码。
+
+#### 具体实现方法
+
+1. JSON frontend 支持 int8 data 解析（JSON 中存整数值）。
+2. Codegen 中 `emit_matmul()` / `emit_conv2d()` 增加 int8 分支：
+   - `int8 × int8 → int32`
+3. `params.bin` 中 int8 tensor 按 1 字节存储。
+4. 提供 `examples/json/mlp_int8.json`。
+
+#### 完成标准
+
+- int8 MLP 编译 + 运行成功
+- 输出类型为 int32
+- params.bin 中 int8 tensor 大小正确
+
+### 8.6 阶段 6 结束后你应该能做什么
+
+- 编译和运行 int8 量化模型
+- 任何 dtype 错误在编译期被捕获
+- DType 系统可方便扩展
+
+---
+
+## 9. 阶段 7：图变换与算子扩展
+
+### 9.1 本阶段目标
+
+扩展算子覆盖面，让项目能处理真实 CNN 的常见算子，并把 FusePass 做成可扩展的模式匹配框架。
+
+### 9.2 本阶段要新增或重点修改的文件
+
+- `src/pass/graph/infer_shape_pass.cpp`
+- `src/codegen/c_codegen.cpp`
+- `include/tiny_tvm/pass/graph/bn_fold_pass.h`
+- `src/pass/graph/bn_fold_pass.cpp`
+- `include/tiny_tvm/pass/graph/fuse_pass.h`
+- `src/pass/graph/fuse_pass.cpp`
+- `tests/pass/bn_fold_test.cpp`
+- `tests/pass/pattern_fuse_test.cpp`
+- `tests/runtime/full_cnn_e2e_test.cpp`
+- `examples/json/cnn_bn.json`
+
+### 9.3 任务 7-1：补充常用算子
+
+#### 要做什么
+
+新增 `MaxPool2D`、`GlobalAvgPool2D`、`Softmax`、`BatchNorm`（推理模式）。
+
+#### 具体实现方法
+
+1. **MaxPool2D**（NCHW）
+   - attrs：`kernel_shape`、`strides`、`pads`
+   - shape infer：`OH = (H + 2*pad - KH) / stride + 1`
+   - codegen：4 层循环 + 2 层 pool 核，取 max
+2. **GlobalAvgPool2D**
+   - shape infer：`[N,C,H,W] → [N,C,1,1]`
+   - codegen：对 `(n,c)` 遍历，累加 `H×W` 后除以 `H*W`
+3. **Softmax**
+   - attrs：`axis`（默认 -1）
+   - shape infer：输出 = 输入 shape
+   - codegen：`max → exp(x-max) → sum → div`
+4. **BatchNorm**（推理模式）
+   - 输入：`x, scale, bias, mean, var`
+   - attrs：`epsilon`
+   - codegen：`y = scale * (x - mean) / sqrt(var + eps) + bias`
+
+#### 完成标准
+
+- 4 个新算子 shape infer 和 codegen 正确
+- 含新算子的模型能编译运行
+
+### 9.4 任务 7-2：实现 `BatchNormFoldPass`
+
+#### 要做什么
+
+当 BN 紧跟 Conv2D 时，把 BN 参数折叠进 Conv 的 weight 和 bias。
+
+#### 具体实现方法
+
+1. 计算：
+   - `scale[c] = gamma[c] / sqrt(var[c] + eps)`
+   - `new_bias[c] = beta[c] - gamma[c] * mean[c] / sqrt(var[c] + eps)`
+2. 折叠到 Conv：
+   - `new_weight[oc] = scale[oc] * old_weight[oc]`
+   - `new_bias[oc] = scale[oc] * old_conv_bias[oc] + bn_new_bias[oc]`
+3. 删除 BN op，更新 Conv 输出为 BN 输出 tensor。
+
+#### 完成标准
+
+- Conv + BN 折叠后 BN op 消失
+- 折叠前后数值一致（误差 < 1e-5）
+
+### 9.5 任务 7-3：扩展 FusePass 为模式匹配框架
+
+#### 要做什么
+
+把 FusePass 从硬编码改成模式描述 + 匹配引擎。
+
+#### 具体实现方法
+
+1. 定义 `FusePattern` 结构：
+   ```cpp
+   struct FusePattern {
+       std::string name;  // 如 "ConvRelu"
+       std::string head;  // 如 "Conv2D"
+       std::string tail;  // 如 "Relu"
+   };
+   ```
+2. `FusePass` 维护一组 patterns，默认注册：
+   - `{"ConvRelu", "Conv2D", "Relu"}`
+   - `{"MatMulAdd", "MatMul", "Add"}`
+3. 匹配引擎遍历 op，尝试匹配 head → 检查输出唯一 consumer 是 tail → 执行融合。
+4. 新增融合规则只需添加 `FusePattern`，不改匹配逻辑。
+
+#### 完成标准
+
+- `MatMul + Add` 和 `Conv + Relu` 都被正确融合
+- 新规则只需一行注册
+
+### 9.6 阶段 7 结束后你应该能做什么
+
+- 编译含 BN / Pool / Softmax 的完整 CNN
+- BN 被折叠进 Conv
+- FusePass 可扩展
+
+---
+
+## 10. 阶段 8：真正的 TensorIR 雏形（⭐ 最重要）
+
+### 10.1 本阶段目标
+
+引入 LoopIR，把计算描述（Op）和调度描述（怎么跑）完全分离。这是 **TVM TensorIR 的精髓**。
+
+### 10.2 设计原则
+
+- Op → LoopIR 是一次 lowering
+- Schedule 操作（split、reorder、fuse）作用于 LoopIR
+- Codegen 只需递归遍历 LoopIR 就能发射代码
+
+### 10.3 本阶段要新增或重点修改的文件
+
+- `include/tiny_tvm/ir/loop_ir.h`
+- `src/ir/loop_ir.cpp`
+- `include/tiny_tvm/pass/lower/lower_to_loop_ir_pass.h`
+- `src/pass/lower/lower_to_loop_ir_pass.cpp`
+- `include/tiny_tvm/pass/schedule/schedule_primitives.h`
+- `src/pass/schedule/schedule_primitives.cpp`
+- `include/tiny_tvm/codegen/loop_ir_codegen.h`
+- `src/codegen/loop_ir_codegen.cpp`
+- `src/tools/ttvmc.cpp`
+- `tests/ir/loop_ir_test.cpp`
+- `tests/codegen/loop_ir_codegen_test.cpp`
+- `tests/runtime/loop_ir_e2e_test.cpp`
+
+### 10.4 任务 8-1：抽象循环 IR（LoopIR）
+
+#### 要做什么
+
+定义 LoopIR 的核心数据结构：`LoopVar`、`Block`、`LoopProgram`。
+
+#### 具体实现方法
+
+1. 在 `loop_ir.h` 中定义：
+   ```cpp
+   struct LoopVar {
+       std::string name;
+       int64_t extent = 0;
+   };
+
+   struct Block {
+       std::string name;
+       std::vector<LoopVar> loop_vars;
+       std::vector<int> loop_order;
+       std::string compute_body;
+       std::vector<int> read_tensors;
+       std::vector<int> write_tensors;
+       struct TileInfo {
+           int var_index = -1;
+           int factor = -1;
+           int outer_index = -1;
+           int inner_index = -1;
+       };
+       std::vector<TileInfo> tiles;
+       bool unroll_innermost = false;
+   };
+
+   struct LoopProgram {
+       std::vector<Block> blocks;
+       const Graph* source_graph = nullptr;
+   };
+   ```
+2. 每个 Block 对应一个 Op。
+3. `loop_order` 记录执行顺序，split 后增加新 var。
+
+#### 完成标准
+
+- LoopIR 能表达 MatMul / Conv2D 嵌套循环
+- 能表达 split 和 reorder 结果
+
+### 10.5 任务 8-2：实现 `LowerToLoopIRPass` 和 Schedule 原语
+
+#### `LowerToLoopIRPass` 实现方法
+
+1. 遍历 `Graph.ops()`，对每个 op 生成 `Block`。
+2. MatMul `[M,K]×[K,N]`：
+   - `loop_vars = [{i,M}, {j,N}, {k,K}]`
+   - `loop_order = [0,1,2]`
+3. Conv2D：7 个 loop_vars（n, oc, oh, ow, ic, kh, kw）
+4. 逐元素 op：按 shape rank 生成 loop_vars。
+
+#### Schedule 原语实现方法
+
+```cpp
+void split(Block& block, int var_index, int factor);
+void reorder(Block& block, const std::vector<int>& new_order);
+void fuse_loops(Block& block, int var1_index, int var2_index);
+```
+
+- **split**：把一个 LoopVar 分裂成 outer + inner 两层
+- **reorder**：替换 loop_order
+- **fuse_loops**：合并相邻循环，新 extent = v1 × v2
+
+#### 完成标准
+
+- MatMul / Conv2D / Add / Relu 能转成 Block
+- split / reorder / fuse 正确修改 Block 结构
+
+### 10.6 任务 8-3：Codegen 从 LoopIR 生成 C 代码
+
+#### 具体实现方法
+
+1. 新建 `loop_ir_codegen.cpp`：
+   ```cpp
+   std::string emit_c_from_loop_program(const LoopProgram& prog);
+   ```
+2. 遍历 blocks，按 loop_order 发射嵌套 for 循环。
+3. tile 时外层按步进、内层按 factor。
+4. `unroll_innermost` 时手动展开。
+5. 修改 `ttvmc compile` 管线加入 LowerToLoopIR 步骤。
+6. 保留旧 codegen 作为 fallback。
+
+#### 完成标准
+
+- LoopIR codegen 和旧 codegen 功能等价
+- split + reorder 后代码结构不同
+- 数值一致
+
+### 10.7 阶段 8 结束后你应该能做什么
+
+- 理解 TVM TensorIR 的计算-调度分离思想
+- 通过 split / reorder / fuse 控制代码结构
+- Codegen 从 LoopIR 生成，不再硬编码
+
+---
+
+## 11. 阶段 9：性能分析与 Auto-Tuning 雏形
+
+### 11.1 本阶段目标
+
+引入性能测量和自动调参能力。
+
+### 11.2 本阶段要新增或重点修改的文件
+
+- `include/tiny_tvm/runtime/profiler.h`
+- `src/runtime/profiler.cpp`
+- `src/codegen/c_codegen.cpp`（或 `loop_ir_codegen.cpp`）
+- `include/tiny_tvm/tune/auto_tuner.h`
+- `src/tune/auto_tuner.cpp`
+- `src/tools/ttvmc.cpp`
+- `tests/runtime/profiler_test.cpp`
+- `tests/tune/auto_tuner_test.cpp`
+
+### 11.3 任务 9-1：编译时性能 Profile 基础设施
+
+#### 要做什么
+
+在 `run_model` 中增加计时，支持按 op 粒度计时，输出 `profile_report.json`。
+
+#### 具体实现方法
+
+1. 生成的 `deploy.c` 中为每个 op 前后插入计时桩（`#ifdef TINY_TVM_PROFILE`）。
+2. 增加导出函数 `tiny_tvm_get_profile(double* out_times, int max_ops)`。
+3. `run_model --profile`：
+   - 编译时加 `-DTINY_TVM_PROFILE`
+   - 多次运行取中位数
+   - 输出 `profile_report.json`
+
+#### 完成标准
+
+- `run_model --profile` 输出每个 op 耗时
+- profile_report.json 格式正确
+
+### 11.4 任务 9-2：实现简单 Auto-Tuner（GridSearch 版）
+
+#### 要做什么
+
+对 MatMul 的 tile 参数网格搜索，找最快配置。
+
+#### 具体实现方法
+
+1. 枚举 `(tile_m, tile_n, tile_k)` 组合（候选值 `[8, 16, 32, 64]`）。
+2. 对每个组合：设置 schedule → 生成代码 → 编译 → profile → 记录耗时。
+3. 选出最快组合，输出 `best_schedule.json`。
+
+#### 完成标准
+
+- GridSearch 跑完所有候选
+- 最终配置不慢于默认
+- 输出 best_schedule.json
+
+### 11.5 任务 9-3：`ttvmc tune` 子命令
+
+#### 要做什么
+
+为 `ttvmc` 增加 `tune` 子命令。
+
+#### 具体实现方法
+
+1. 命令格式：`./build/ttvmc tune model.json -o out/ --schedule-out best_schedule.json`
+2. 对每个 MatMul op 调用 AutoTuner。
+3. `compile` 增加 `--schedule` 参数读取调参结果。
+4. 打印调参进度。
+
+#### 完成标准
+
+- `ttvmc tune` 输出 best_schedule.json
+- `ttvmc compile --schedule` 能应用调参结果
+
+### 11.6 阶段 9 结束后你应该能做什么
+
+- 按 op 粒度分析性能
+- 自动搜索最优 tile 配置
+- 理解 TVM AutoTVM 的闭环
+
+---
+
+## 12. 每个阶段必须补的测试
+
+这个部分不是"有空再做"，而是每一阶段都必须跟着补。
 
 ### 阶段 0 测试
 
@@ -1057,9 +1466,32 @@ qemu-arm -L /usr/arm-linux-gnueabihf build-arm/run_model out/mlp input.bin outpu
 
 - Host / ARM 输出对比脚本或测试
 
+### 阶段 6 测试
+
+- `tests/pass/type_check_test.cpp`
+- `tests/runtime/int8_matmul_e2e_test.cpp`
+- dtype_size 正确性验证
+
+### 阶段 7 测试
+
+- `tests/pass/bn_fold_test.cpp`
+- `tests/pass/pattern_fuse_test.cpp`
+- `tests/runtime/full_cnn_e2e_test.cpp`
+
+### 阶段 8 测试
+
+- `tests/ir/loop_ir_test.cpp`
+- `tests/codegen/loop_ir_codegen_test.cpp`
+- `tests/runtime/loop_ir_e2e_test.cpp`
+
+### 阶段 9 测试
+
+- `tests/runtime/profiler_test.cpp`
+- `tests/tune/auto_tuner_test.cpp`
+
 ---
 
-## 9. 推荐开发顺序（严格按这个顺序走）
+## 13. 推荐开发顺序（严格按这个顺序走）
 
 1. 完成阶段 0，保证骨架稳定
 2. 完成阶段 1，跑通 MLP
@@ -1067,12 +1499,17 @@ qemu-arm -L /usr/arm-linux-gnueabihf build-arm/run_model out/mlp input.bin outpu
 4. 完成阶段 3，接入 ONNX + DCE + MemoryReuse
 5. 完成阶段 4，让 Schedule 真正影响 MatMul codegen
 6. 完成阶段 5，把模型跑到 ARM / QEMU
+7. 完成阶段 6，支持多 dtype 和 int8 量化推理
+8. 完成阶段 7，扩展算子集合 + BN 折叠 + 模式匹配融合
+9. 完成阶段 8，引入 LoopIR 实现计算-调度分离（⭐ 核心阶段）
+10. 完成阶段 9，增加性能分析和 Auto-Tuning
 
 不要跳步，尤其不要在阶段 1 没闭环前就去碰 ONNX 或 Schedule。
+阶段 6-7 可以在阶段 5 之后并行推进，但阶段 8 依赖阶段 4 的 Schedule 体系，阶段 9 依赖阶段 8 的 LoopIR。
 
 ---
 
-## 10. 你现在应该怎么开始
+## 14. 你现在应该怎么开始
 
 如果你现在就要进入编码，直接按下面顺序开工：
 
