@@ -17,7 +17,20 @@ enum class DType {
     kInt32,
 };
 
+inline DType str_to_dtype(const std::string& str) {
+    static const std::unordered_map<std::string, DType> table = {
+        {"float32", DType::kFloat32},
+        {"f32",     DType::kFloat32},
+        {"int32",   DType::kInt32},
+        {"i32",     DType::kInt32},
+    };
 
+    auto it = table.find(str);
+    if (it != table.end()) {
+        return it->second;
+    }
+    return DType::kUnknown;
+}
 
 inline std::size_t dtype_size(DType dtype) noexcept {
     switch (dtype) {
