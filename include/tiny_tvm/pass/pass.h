@@ -4,6 +4,7 @@
 
 #include "utils.h"
 #include "tiny_tvm/ir/graph.h"
+#include "tiny_tvm/schedule/schedule.h"
 
 namespace tiny_tvm::passes {
 
@@ -23,7 +24,19 @@ public:
 class InferShapePass : public Pass {
 public:
     std::string name() const override {return "InferShapePass";}
-    void run(ir::Graph& graph) override {}
+    void run(ir::Graph& graph) override {(void)graph;}
+};
+
+class NaiveMemoryPlanner : public Pass {
+public:
+    std::string name() const override {return "NaiveMemoryPlanner";}
+    void run(ir::Graph& graph) override {(void)graph;}
+};
+
+class InitSchedulePass : public Pass {
+public:
+    std::string name() const override {return "InitSchedulePass";}
+    void run(ir::Graph& graph) override {(void)graph;}
 };
 
 
